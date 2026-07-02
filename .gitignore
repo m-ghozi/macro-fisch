@@ -38,3 +38,6 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Screenshot kalibrasi (jangan commit)
+screen*.png

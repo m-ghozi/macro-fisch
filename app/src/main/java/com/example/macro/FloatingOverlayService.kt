@@ -2,7 +2,9 @@ package com.example.macro
 
 import android.app.*
 import android.content.Intent
+import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.Paint
 import android.graphics.PixelFormat
 import android.os.Build
 import android.os.Handler
@@ -26,6 +28,8 @@ class FloatingOverlayService : Service() {
     private lateinit var toggleButton: Button
     private lateinit var params: WindowManager.LayoutParams
 
+    private var guideView: GuideView? = null   // overlay garis kalibrasi (full-screen, tak bisa disentuh)
+
     private val mainHandler = Handler(Looper.getMainLooper())
     private var statusPoller: Runnable? = null
 
@@ -36,7 +40,68 @@ class FloatingOverlayService : Service() {
         startForegroundWithNotification()
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
         buildOverlayView()
+        buildGuideOverlay()
         startStatusPolling()
+    }
+
+    /**
+     * Overlay full-screen transparan yang menggambar area scan (barLeftX..barRightX @ barY),
+     * targetX, titik tap, dan posisi marker terdeteksi. FLAG_NOT_TOUCHABLE -> sentuhan tembus ke game.
+     * Koordinat MacroController = pixel framebuffer landscape, jadi mapping ke view ~1:1.
+     */
+    private fun buildGuideOverlay() {
+        val view = GuideView(this)
+        guideView = view
+
+        val overlayType =
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+            else
+                @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE
+
+        val lp = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.MATCH_PARENT,
+            overlayType,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            x = 0
+            y = 0
+        }
+        windowManager.addView(view, lp)
+    }
+
+    /** View yang menggambar guide kalibrasi. Di-refresh dari status poller. */
+    private inner class GuideView(context: android.content.Context) : View(context) {
+        private val scanPaint = Paint().apply { color = Color.CYAN; strokeWidth = 3f }
+        private val targetPaint = Paint().apply { color = Color.RED; strokeWidth = 4f }
+        private val tapPaint = Paint().apply { color = Color.GREEN; style = Paint.Style.STROKE; strokeWidth = 4f }
+        private val markerPaint = Paint().apply { color = Color.YELLOW; strokeWidth = 4f }
+        private val textPaint = Paint().apply { color = Color.WHITE; textSize = 28f; isAntiAlias = true }
+
+        override fun onDraw(canvas: Canvas) {
+            val c = MacroController
+            val y = c.barY.toFloat()
+            // garis scan (area yang dibaca)
+            canvas.drawLine(c.barLeftX.toFloat(), y, c.barRightX.toFloat(), y, scanPaint)
+            canvas.drawText("scan y=${c.barY} [${c.barLeftX}..${c.barRightX}]", c.barLeftX.toFloat(), y - 12f, textPaint)
+            // target (garis vertikal merah)
+            canvas.drawLine(c.targetX.toFloat(), y - 60f, c.targetX.toFloat(), y + 60f, targetPaint)
+            canvas.drawText("target=${c.targetX}", c.targetX.toFloat() + 6f, y - 70f, textPaint)
+            // titik tap (lingkaran hijau)
+            canvas.drawCircle(c.tapX.toFloat(), c.tapY.toFloat(), 30f, tapPaint)
+            canvas.drawText("tap", c.tapX.toFloat() + 34f, c.tapY.toFloat(), textPaint)
+            // marker terdeteksi (garis kuning, live)
+            val mx = c.lastMarkerX
+            if (mx >= 0) {
+                canvas.drawLine(mx.toFloat(), y - 40f, mx.toFloat(), y + 40f, markerPaint)
+                canvas.drawText("marker=$mx", mx.toFloat() + 6f, y + 70f, textPaint)
+            }
+        }
     }
 
     private fun buildOverlayView() {
@@ -131,6 +196,7 @@ class FloatingOverlayService : Service() {
                 tvAccessibility.text =
                     "Accessibility: ${if (TapMacroAccessibilityService.instance != null) "ON" else "OFF"}"
                 toggleButton.text = if (MacroController.isHolding) "STOP" else "START"
+                guideView?.invalidate()   // redraw marker live
                 mainHandler.postDelayed(this, 500)
             }
         }
@@ -157,5 +223,6 @@ class FloatingOverlayService : Service() {
         super.onDestroy()
         statusPoller?.let { mainHandler.removeCallbacks(it) }
         if (::rootView.isInitialized) windowManager.removeView(rootView)
+        guideView?.let { windowManager.removeView(it) }
     }
 }

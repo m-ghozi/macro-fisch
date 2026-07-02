@@ -60,24 +60,30 @@ class ScreenCaptureService : Service() {
         return START_STICKY
     }
 
-    /** Cuma capture area sekecil mungkin di sekitar bar, bukan full screen -> jauh lebih cepat & ringan. */
+    /**
+     * Capture FULL screen resolusi asli (1:1, tanpa scaling), lalu crop baris bar secara
+     * software di processFrame(). VirtualDisplay selalu mirror SELURUH display — bikin surface
+     * kecil malah men-scale seluruh layar dan koordinat jadi ngawur. Karena itu capture penuh,
+     * tapi cuma scan 1 baris di barY (tetap ringan).
+     */
     private fun startCropCapture() {
-        val width = (MacroController.barRightX - MacroController.barLeftX).coerceAtLeast(2)
-        val height = 4 // cukup beberapa baris vertikal di sekitar barY
+        val metrics = android.util.DisplayMetrics()
+        @Suppress("DEPRECATION")
+        (getSystemService(WINDOW_SERVICE) as android.view.WindowManager).defaultDisplay.getRealMetrics(metrics)
+        // getRealMetrics kasih orientasi natural (portrait). Game selalu landscape, jadi paksa
+        // sisi panjang = lebar biar 1:1 dengan framebuffer landscape (sama seperti `adb screencap`).
+        // ponytail: hardcode landscape; kalau nanti perlu portrait, baca display.rotation.
+        val width = maxOf(metrics.widthPixels, metrics.heightPixels)
+        val height = minOf(metrics.widthPixels, metrics.heightPixels)
 
         imageReader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
 
         virtualDisplay = mediaProjection?.createVirtualDisplay(
             "MacroCapture",
-            width, height, resources.displayMetrics.densityDpi,
-            android.hardware.display.DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+            width, height, metrics.densityDpi,
+            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
             imageReader?.surface, null, captureHandler
         )
-        // CATATAN: createVirtualDisplay dengan surface sekecil ini otomatis men-scale konten
-        // dari layar penuh ke ukuran surface. Supaya crop-nya tepat pada koordinat bar asli,
-        // pendekatan yang lebih presisi adalah capture FULL screen lalu crop buffer secara
-        // software (lihat catatan di README). Versi ini contoh paling sederhana/cepat untuk
-        // kasus di mana bar sudah mendekati lebar layar.
 
         imageReader?.setOnImageAvailableListener({ reader ->
             val image = reader.acquireLatestImage() ?: return@setOnImageAvailableListener
@@ -89,18 +95,22 @@ class ScreenCaptureService : Service() {
         }, captureHandler)
     }
 
+    private var lastLogMs = 0L
+
     private fun processFrame(image: android.media.Image) {
         val plane = image.planes[0]
         val buffer = plane.buffer
         val pixelStride = plane.pixelStride
         val rowStride = plane.rowStride
-        val width = image.width
 
-        // scan 1 baris tengah, cari piksel pertama yang match warna marker
-        val row = image.height / 2
+        // Koordinat sudah absolut (buffer = full screen), tidak perlu + barLeftX lagi.
+        val row = MacroController.barY.coerceIn(0, image.height - 1)
+        val left = MacroController.barLeftX.coerceIn(0, image.width - 1)
+        val right = MacroController.barRightX.coerceIn(left, image.width - 1)
+
         var foundX = -1
-        var x = 0
-        while (x < width) {
+        var x = left
+        while (x <= right) {
             val offset = row * rowStride + x * pixelStride
             val r = buffer.get(offset).toInt() and 0xFF
             val g = buffer.get(offset + 1).toInt() and 0xFF
@@ -111,11 +121,27 @@ class ScreenCaptureService : Service() {
             }
             x++
         }
-        buffer.rewind()
+
+        // DEBUG kalibrasi (Fase 3): dump profil warna sepanjang baris bar tiap ~60px, throttle 500ms.
+        // Dari sini kita lihat di mana putih/hitam/marker biar set markerColorMin/Max & targetX akurat.
+        val now = System.currentTimeMillis()
+        if (now - lastLogMs > 500) {
+            lastLogMs = now
+            val sb = StringBuilder("row=$row scan:")
+            var sx = left
+            while (sx <= right) {
+                val o = row * rowStride + sx * pixelStride
+                val rr = buffer.get(o).toInt() and 0xFF
+                val gg = buffer.get(o + 1).toInt() and 0xFF
+                val bb = buffer.get(o + 2).toInt() and 0xFF
+                sb.append(" $sx=($rr,$gg,$bb)")
+                sx += 60
+            }
+            android.util.Log.d("MacroController", sb.toString())
+        }
 
         if (foundX >= 0) {
-            val absoluteX = MacroController.barLeftX + foundX
-            MacroController.onMarkerDetected(absoluteX)
+            MacroController.onMarkerDetected(foundX)
         }
     }
 
