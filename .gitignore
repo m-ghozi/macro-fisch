@@ -1,0 +1,40 @@
+# Gradle
+.gradle/
+build/
+*/build/
+
+# Android / SDK
+local.properties
+*.apk
+*.aab
+*.ap_
+*.dex
+*.class
+bin/
+gen/
+out/
+release/
+
+# Keystore / signing (JANGAN commit)
+*.jks
+*.keystore
+keystore.properties
+
+# Kotlin
+.kotlin/
+
+# IDE - Android Studio / IntelliJ
+.idea/
+*.iml
+captures/
+.navigation/
+
+# IDE - VS Code
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
