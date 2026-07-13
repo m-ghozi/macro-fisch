@@ -10,16 +10,7 @@ import android.view.accessibility.AccessibilityEvent
 class TapMacroAccessibilityService : AccessibilityService() {
 
     private val mainHandler = Handler(Looper.getMainLooper())
-    private var currentStroke: GestureDescription.StrokeDescription? = null
-    private var pollRunnable: Runnable? = null
-
-    // Posisi "pena" saat ini. continueStroke WAJIB mulai tepat di titik akhir segmen sebelumnya,
-    // kalau meleset (walau 1px) sistem membatalkan gesture. Kita wiggle 1px bolak-balik di sekitar tapX.
-    private var penX = 0f
-    private var penY = 0f
-
-    // Segmen hold dipecah kecil2 (150ms) supaya bisa dihentikan presisi kapan saja
-    private val holdSegmentMs = 150L
+    private var scanningRunnable: Runnable? = null
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -29,95 +20,52 @@ class TapMacroAccessibilityService : AccessibilityService() {
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
     override fun onInterrupt() {}
 
-    /** Dipanggil dari luar (mis. tombol Start di MainActivity / overlay) untuk memulai 1 siklus. */
-    fun startHoldCycle() {
-        MacroController.startCycle()
-        beginHold()
-        startPollingForRelease()
+    fun startScanLoop() {
+        MacroController.startScanning()
+        scanLoop()   // polling for pendingTap
     }
 
-    private fun beginHold() {
-        penX = MacroController.tapX.toFloat()
-        penY = MacroController.tapY.toFloat()
-        val stroke = GestureDescription.StrokeDescription(nextHoldPath(), 0, holdSegmentMs, true)
-        currentStroke = stroke
-        dispatchSegment(stroke)
+    fun stopScanLoop() {
+        MacroController.stopScanning()
+        scanningRunnable?.let { mainHandler.removeCallbacks(it) }
+        scanningRunnable = null
     }
 
-    /**
-     * Path 1 segmen hold: mulai TEPAT di titik akhir segmen sebelumnya (penX,penY),
-     * lalu geser 1px ke arah tapX. Non-empty (wajib) + start point nyambung (wajib biar tak di-cancel).
-     */
-    private fun nextHoldPath(): Path {
-        val startX = penX
-        val endX = if (penX > MacroController.tapX.toFloat()) penX - 1f else penX + 1f
-        penX = endX
-        return Path().apply {
-            moveTo(startX, penY)
-            lineTo(endX, penY)
-        }
-    }
-
-    private fun dispatchSegment(stroke: GestureDescription.StrokeDescription) {
-    val gesture = GestureDescription.Builder().addStroke(stroke).build()
-    val queued = dispatchGesture(gesture, object : GestureResultCallback() {
-        override fun onCompleted(gestureDescription: GestureDescription?) {
-            android.util.Log.d("TapMacro", "Segment completed at ${System.currentTimeMillis()}")
-            if (MacroController.shouldRelease) {
-                releaseNow()
-            } else if (MacroController.isHolding) {
-                val next = currentStroke!!.continueStroke(nextHoldPath(), 0, holdSegmentMs, true)
-                currentStroke = next
-                dispatchSegment(next)
-            }
-        }
-        override fun onCancelled(gestureDescription: GestureDescription?) {
-            android.util.Log.e("TapMacro", "Gesture CANCELLED by system!")
-            MacroController.resetCycle()
-        }
-    }, mainHandler)
-    android.util.Log.d("TapMacro", "dispatchGesture queued=$queued at ${System.currentTimeMillis()}")
-}
-
-    private fun releaseNow() {
-        val stroke = currentStroke ?: return
-        // Segmen terakhir juga harus mulai tepat di penX (titik akhir segmen sebelumnya) + non-empty.
-        val startX = penX
-        val endX = if (penX > MacroController.tapX.toFloat()) penX - 1f else penX + 1f
-        val path = Path().apply {
-            moveTo(startX, penY)
-            lineTo(endX, penY)
-        }
-        val finalStroke = stroke.continueStroke(path, 0, 10, false) // willContinue=false -> lepas sentuhan
-        val gesture = GestureDescription.Builder().addStroke(finalStroke).build()
-        dispatchGesture(gesture, null, null)
-        MacroController.resetCycle()
-        stopPolling()
-    }
-
-    /**
-     * MacroController.onMarkerDetected() sudah men-set shouldRelease dari thread capture,
-     * tapi release fisik tetap ditembak dari sini (siklus onCompleted) supaya tidak dispatch
-     * gesture baru saat gesture sebelumnya masih berjalan (bisa bikin gesture dibatalkan sistem).
-     * Polling ini hanya fallback jaga-jaga kalau segmen hold kepanjangan.
-     */
-    private fun startPollingForRelease() {
-        pollRunnable = object : Runnable {
+    private fun scanLoop() {
+        scanningRunnable = object : Runnable {
             override fun run() {
-                if (!MacroController.isHolding) return
-                if (MacroController.shouldRelease) {
-                    // onCompleted pada segmen berjalan akan handle release;
-                    // di sini cuma cek watchdog tiap 20ms.
+                val c = MacroController
+                if (!c.isScanning) return
+
+                val tx = c.pendingTapX
+                val ty = c.pendingTapY
+                if (tx >= 0 && ty >= 0) {
+                    dispatchSingleTap(tx.toFloat(), ty.toFloat())
+                    // cooldown ~400ms setelah tap — kasih waktu lingkaran menghilang
+                    // ponytail: hardco, nanti kalau perlu adjustable via overlay.
+                    c.clearPendingTap()
+                    c.nextScanAtMs = System.currentTimeMillis() + 400
                 }
-                mainHandler.postDelayed(this, 20)
+
+                mainHandler.postDelayed(this, 30) // ~33fps polling
             }
         }
-        mainHandler.post(pollRunnable!!)
+        mainHandler.post(scanningRunnable!!)
     }
 
-    private fun stopPolling() {
-        pollRunnable?.let { mainHandler.removeCallbacks(it) }
-        pollRunnable = null
+    /**
+     * Single tap di (x, y) via dispatchGesture.
+     * Path: moveTo(x,y) -> lineTo(x,y) (non-empty) -> durasi 50ms -> willContinue=false.
+     */
+    private fun dispatchSingleTap(x: Float, y: Float) {
+        val path = Path().apply {
+            moveTo(x, y)
+            lineTo(x, y)   // non-empty
+        }
+        val stroke = GestureDescription.StrokeDescription(path, 0, 50, false)
+        val gesture = GestureDescription.Builder().addStroke(stroke).build()
+        dispatchGesture(gesture, null, null)
+        android.util.Log.d("TapMacro", "tap $x,$y")
     }
 
     companion object {

@@ -24,13 +24,12 @@ class ScreenCaptureService : Service() {
 
     private val projectionCallback = object : MediaProjection.Callback() {
         override fun onStop() {
-            // dipanggil sistem kalau user cabut izin screen-share dari notifikasi/quick-settings
             virtualDisplay?.release()
             imageReader?.close()
             stopSelf()
         }
     }
-    
+
     companion object {
         const val CHANNEL_ID = "macro_capture_channel"
         const val NOTIF_ID = 1
@@ -51,28 +50,19 @@ class ScreenCaptureService : Service() {
         val resultData = intent.getParcelableExtra<Intent>(EXTRA_RESULT_DATA) ?: return START_NOT_STICKY
 
         startForeground(NOTIF_ID, buildNotification())
+        isRunning = true
 
-            val mpm = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+        val mpm = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
         mediaProjection = mpm.getMediaProjection(resultCode, resultData)
         mediaProjection?.registerCallback(projectionCallback, captureHandler)
-        startCropCapture()
-
+        startFullCapture()
         return START_STICKY
     }
 
-    /**
-     * Capture FULL screen resolusi asli (1:1, tanpa scaling), lalu crop baris bar secara
-     * software di processFrame(). VirtualDisplay selalu mirror SELURUH display — bikin surface
-     * kecil malah men-scale seluruh layar dan koordinat jadi ngawur. Karena itu capture penuh,
-     * tapi cuma scan 1 baris di barY (tetap ringan).
-     */
-    private fun startCropCapture() {
+    private fun startFullCapture() {
         val metrics = android.util.DisplayMetrics()
         @Suppress("DEPRECATION")
         (getSystemService(WINDOW_SERVICE) as android.view.WindowManager).defaultDisplay.getRealMetrics(metrics)
-        // getRealMetrics kasih orientasi natural (portrait). Game selalu landscape, jadi paksa
-        // sisi panjang = lebar biar 1:1 dengan framebuffer landscape (sama seperti `adb screencap`).
-        // ponytail: hardcode landscape; kalau nanti perlu portrait, baca display.rotation.
         val width = maxOf(metrics.widthPixels, metrics.heightPixels)
         val height = minOf(metrics.widthPixels, metrics.heightPixels)
 
@@ -98,63 +88,79 @@ class ScreenCaptureService : Service() {
     private var lastLogMs = 0L
 
     private fun processFrame(image: android.media.Image) {
+        val c = MacroController
+        if (!c.canScan()) return
+
         val plane = image.planes[0]
         val buffer = plane.buffer
         val pixelStride = plane.pixelStride
         val rowStride = plane.rowStride
 
-        // Koordinat sudah absolut (buffer = full screen), tidak perlu + barLeftX lagi.
-        val row = MacroController.barY.coerceIn(0, image.height - 1)
-        val left = MacroController.barLeftX.coerceIn(0, image.width - 1)
-        val right = MacroController.barRightX.coerceIn(left, image.width - 1)
+        val left = c.scanLeft.coerceIn(0, image.width - 1)
+        val top = c.scanTop.coerceIn(0, image.height - 1)
+        val right = c.scanRight.coerceIn(left + 1, image.width - 1)
+        val bottom = c.scanBottom.coerceIn(top + 1, image.height - 1)
+        val threshold = c.brightThreshold
 
-        var foundX = -1
-        var x = left
-        while (x <= right) {
-            val offset = row * rowStride + x * pixelStride
-            val r = buffer.get(offset).toInt() and 0xFF
-            val g = buffer.get(offset + 1).toInt() and 0xFF
-            val b = buffer.get(offset + 2).toInt() and 0xFF
-            if (isMarkerColor(r, g, b)) {
-                foundX = x
-                break
+        // Stride 6 — cukup untuk lingkaran minimal ~30px diameter.
+        // ponytail: hardcode stride, tambah adjust di overlay kalau perlu.
+        val stride = 6
+
+        var sumX = 0L
+        var sumY = 0L
+        var count = 0
+
+        var y = top
+        while (y <= bottom) {
+            val rowBase = y * rowStride
+            var x = left
+            while (x <= right) {
+                val offset = rowBase + x * pixelStride
+                val r = buffer.get(offset).toInt() and 0xFF
+                if (r > threshold) {
+                    val g = buffer.get(offset + 1).toInt() and 0xFF
+                    val b = buffer.get(offset + 2).toInt() and 0xFF
+                    if (g > threshold && b > threshold) {
+                        sumX += x; sumY += y; count++
+                    }
+                }
+                x += stride
             }
-            x++
+            y += stride
         }
 
-        // DEBUG kalibrasi (Fase 3): dump profil warna sepanjang baris bar tiap ~60px, throttle 500ms.
-        // Dari sini kita lihat di mana putih/hitam/marker biar set markerColorMin/Max & targetX akurat.
+        if (count > 0) {
+            val tapX = (sumX / count).toInt()
+            val tapY = (sumY / count).toInt()
+            c.setPendingTap(tapX, tapY)
+            android.util.Log.d("MacroController", "bright center=$tapX,$tapY count=$count")
+        }
+
+        // DEBUG: log crop tiap 1s (3 pixel per baris supaya ringan)
         val now = System.currentTimeMillis()
-        if (now - lastLogMs > 500) {
+        if (now - lastLogMs > 1000) {
             lastLogMs = now
-            val sb = StringBuilder("row=$row scan:")
+            val sb = StringBuilder("scan [$left..$right,$top..$bottom] stride=$stride bright=$threshold:")
             var sx = left
-            while (sx <= right) {
-                val o = row * rowStride + sx * pixelStride
+            var sy = top
+            while (sx <= right && sy <= bottom) {
+                val o = sy * rowStride + sx * pixelStride
                 val rr = buffer.get(o).toInt() and 0xFF
                 val gg = buffer.get(o + 1).toInt() and 0xFF
                 val bb = buffer.get(o + 2).toInt() and 0xFF
-                sb.append(" $sx=($rr,$gg,$bb)")
-                sx += 60
+                sb.append(" ($sx,$sy)=($rr,$gg,$bb)")
+                sx += (right - left) / 3
+                sy += (bottom - top) / 3
+                if (sb.length > 300) break   // batasi log
             }
             android.util.Log.d("MacroController", sb.toString())
         }
-
-        if (foundX >= 0) {
-            MacroController.onMarkerDetected(foundX)
-        }
-    }
-
-    private fun isMarkerColor(r: Int, g: Int, b: Int): Boolean {
-        val min = MacroController.markerColorMin
-        val max = MacroController.markerColorMax
-        return r in min[0]..max[0] && g in min[1]..max[1] && b in min[2]..max[2]
     }
 
     private fun buildNotification(): Notification {
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("Macro aktif")
-            .setContentText("Membaca layar untuk sinkronisasi bar")
+            .setContentText("Scan area untuk lingkaran")
             .setSmallIcon(android.R.drawable.ic_menu_view)
             .setOngoing(true)
             .build()
@@ -171,6 +177,7 @@ class ScreenCaptureService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
+        isRunning = false
         virtualDisplay?.release()
         imageReader?.close()
         mediaProjection?.stop()
@@ -180,5 +187,4 @@ class ScreenCaptureService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 }
 
-// Kotlin tidak punya Activity.RESULT_CANCELED langsung di sini, definisikan konstanta lokal
 private const val Activity_RESULT_CANCELED = 0

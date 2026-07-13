@@ -7,6 +7,7 @@ import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.PixelFormat
 import android.os.Build
+import android.provider.Settings
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
@@ -23,15 +24,26 @@ class FloatingOverlayService : Service() {
 
     private lateinit var windowManager: WindowManager
     private lateinit var rootView: LinearLayout
+    private lateinit var panelView: LinearLayout
+    private lateinit var params: WindowManager.LayoutParams
+
+    private var guideView: GuideView? = null
+
+    // Panel: status
     private lateinit var tvCapture: TextView
     private lateinit var tvAccessibility: TextView
     private lateinit var toggleButton: Button
-    private lateinit var params: WindowManager.LayoutParams
 
-    private var guideView: GuideView? = null   // overlay garis kalibrasi (full-screen, tak bisa disentuh)
+    // Panel: nudge rows (L R T B threshold)
+    private lateinit var tvL: TextView; private lateinit var tvR: TextView
+    private lateinit var tvT: TextView; private lateinit var tvB: TextView
+    private lateinit var tvThreshold: TextView
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private var statusPoller: Runnable? = null
+
+    // Step setiap nudge
+    private val nudgeStep = 10
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -39,165 +51,224 @@ class FloatingOverlayService : Service() {
         super.onCreate()
         startForegroundWithNotification()
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
-        buildOverlayView()
         buildGuideOverlay()
+        buildControlPanel()
         startStatusPolling()
     }
 
-    /**
-     * Overlay full-screen transparan yang menggambar area scan (barLeftX..barRightX @ barY),
-     * targetX, titik tap, dan posisi marker terdeteksi. FLAG_NOT_TOUCHABLE -> sentuhan tembus ke game.
-     * Koordinat MacroController = pixel framebuffer landscape, jadi mapping ke view ~1:1.
-     */
+    // ============ GUIDE OVERLAY ============
+
     private fun buildGuideOverlay() {
         val view = GuideView(this)
         guideView = view
 
-        val overlayType =
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
-                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
-            else
-                @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE
+        val overlayType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+        else @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE
 
         val lp = WindowManager.LayoutParams(
             WindowManager.LayoutParams.MATCH_PARENT,
             WindowManager.LayoutParams.MATCH_PARENT,
             overlayType,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
-                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                    WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
             PixelFormat.TRANSLUCENT
-        ).apply {
-            gravity = Gravity.TOP or Gravity.START
-            x = 0
-            y = 0
-        }
+        ).apply { gravity = Gravity.TOP or Gravity.START; x = 0; y = 0 }
+
         windowManager.addView(view, lp)
     }
 
-    /** View yang menggambar guide kalibrasi. Di-refresh dari status poller. */
-    private inner class GuideView(context: android.content.Context) : View(context) {
-        private val scanPaint = Paint().apply { color = Color.CYAN; strokeWidth = 3f }
-        private val targetPaint = Paint().apply { color = Color.RED; strokeWidth = 4f }
+    private inner class GuideView(ctx: android.content.Context) : View(ctx) {
+        private val rectPaint = Paint().apply { color = Color.CYAN; style = Paint.Style.STROKE; strokeWidth = 3f }
         private val tapPaint = Paint().apply { color = Color.GREEN; style = Paint.Style.STROKE; strokeWidth = 4f }
-        private val markerPaint = Paint().apply { color = Color.YELLOW; strokeWidth = 4f }
-        private val textPaint = Paint().apply { color = Color.WHITE; textSize = 28f; isAntiAlias = true }
+        private val pendingPaint = Paint().apply { color = Color.YELLOW; strokeWidth = 6f }
+        private val textPaint = Paint().apply { color = Color.WHITE; textSize = 24f; isAntiAlias = true }
 
         override fun onDraw(canvas: Canvas) {
             val c = MacroController
-            val y = c.barY.toFloat()
-            // garis scan (area yang dibaca)
-            canvas.drawLine(c.barLeftX.toFloat(), y, c.barRightX.toFloat(), y, scanPaint)
-            canvas.drawText("scan y=${c.barY} [${c.barLeftX}..${c.barRightX}]", c.barLeftX.toFloat(), y - 12f, textPaint)
-            // target (garis vertikal merah)
-            canvas.drawLine(c.targetX.toFloat(), y - 60f, c.targetX.toFloat(), y + 60f, targetPaint)
-            canvas.drawText("target=${c.targetX}", c.targetX.toFloat() + 6f, y - 70f, textPaint)
-            // titik tap (lingkaran hijau)
-            canvas.drawCircle(c.tapX.toFloat(), c.tapY.toFloat(), 30f, tapPaint)
-            canvas.drawText("tap", c.tapX.toFloat() + 34f, c.tapY.toFloat(), textPaint)
-            // marker terdeteksi (garis kuning, live)
-            val mx = c.lastMarkerX
-            if (mx >= 0) {
-                canvas.drawLine(mx.toFloat(), y - 40f, mx.toFloat(), y + 40f, markerPaint)
-                canvas.drawText("marker=$mx", mx.toFloat() + 6f, y + 70f, textPaint)
+            // persegi area scan
+            canvas.drawRect(c.scanLeft.toFloat(), c.scanTop.toFloat(),
+                c.scanRight.toFloat(), c.scanBottom.toFloat(), rectPaint)
+            canvas.drawText("scan area", c.scanLeft.toFloat() + 4f, c.scanTop.toFloat() - 6f, textPaint)
+
+            // titik pending tap
+            val px = c.pendingTapX; val py = c.pendingTapY
+            if (px >= 0 && py >= 0) {
+                canvas.drawCircle(px.toFloat(), py.toFloat(), 16f, pendingPaint)
+                canvas.drawText("tap", px.toFloat() + 20f, py.toFloat() + 6f, textPaint)
             }
+
+            // text scan rect coords
+            val info = "L=${c.scanLeft} R=${c.scanRight} T=${c.scanTop} B=${c.scanBottom} bright>${c.brightThreshold}"
+            canvas.drawText(info, 20f, height - 40f, textPaint)
         }
     }
 
-    private fun buildOverlayView() {
-        rootView = LinearLayout(this).apply {
+    // ============ CONTROL PANEL ============
+
+    private fun buildControlPanel() {
+        panelView = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(24, 20, 24, 20)
+            setPadding(16, 12, 16, 12)
             setBackgroundColor(Color.argb(220, 20, 20, 20))
         }
 
-        tvCapture = TextView(this).apply {
-            text = "Capture: OFF"
-            setTextColor(Color.WHITE)
-            textSize = 12f
-        }
-        tvAccessibility = TextView(this).apply {
-            text = "Accessibility: OFF"
-            setTextColor(Color.WHITE)
-            textSize = 12f
-        }
+        // --- Status ---
+        tvCapture = makeText("Capture: OFF")
+        tvAccessibility = makeText("Accessibility: OFF")
 
         toggleButton = Button(this).apply {
-            text = "START"
+            text = "START SCAN"
             setOnClickListener {
-                if (MacroController.isHolding) {
-                    MacroController.forceRelease()
-                    text = "START"
+                val tap = TapMacroAccessibilityService.instance
+                if (MacroController.isScanning) {
+                    tap?.stopScanLoop()
+                    text = "START SCAN"
                 } else {
-                    TapMacroAccessibilityService.instance?.startHoldCycle()
+                    if (tap == null) {
+                        startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                        return@setOnClickListener
+                    }
+                    if (!ScreenCaptureService.isRunning) {
+                        android.widget.Toast.makeText(this@FloatingOverlayService, "Capture belum aktif!", android.widget.Toast.LENGTH_SHORT).show()
+                        return@setOnClickListener
+                    }
+                    tap.startScanLoop()
                     text = "STOP"
                 }
             }
         }
+        panelView.addView(tvCapture)
+        panelView.addView(tvAccessibility)
+        panelView.addView(toggleButton)
 
-        rootView.addView(tvCapture)
-        rootView.addView(tvAccessibility)
-        rootView.addView(toggleButton)
+        // --- Nudge rows ---
+        panelView.addView(makeDivider())
+        tvL = makeNudgeRow("L (kiri)", "scanLeft") { MacroController.scanLeft }
+        tvR = makeNudgeRow("R (kanan)", "scanRight") { MacroController.scanRight }
+        tvT = makeNudgeRow("T (atas)", "scanTop") { MacroController.scanTop }
+        tvB = makeNudgeRow("B (bawah)", "scanBottom") { MacroController.scanBottom }
 
-        val overlayType =
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
-                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
-            else
-                @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE
+        panelView.addView(makeDivider())
+        tvThreshold = makeNudgeRow("Terang >", "brightThreshold", step = 10, min = 10, max = 255) { MacroController.brightThreshold }
+
+        // --- root wrapper biar bisa drag ---
+        rootView = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+        }
+        rootView.addView(panelView)
+        makeDraggable()
+
+        val overlayType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+        else @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE
 
         params = WindowManager.LayoutParams(
             WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.WRAP_CONTENT,
             overlayType,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
             PixelFormat.TRANSLUCENT
-        ).apply {
-            gravity = Gravity.TOP or Gravity.START
-            x = 0
-            y = 200
-        }
+        ).apply { gravity = Gravity.TOP or Gravity.START; x = 0; y = 400 }
 
-        makeDraggable()
         windowManager.addView(rootView, params)
     }
 
-    /** Drag overlay dengan sentuh-tahan di background root view (bukan di tombol). */
-    private fun makeDraggable() {
-        var initialX = 0
-        var initialY = 0
-        var touchX = 0f
-        var touchY = 0f
+    /** Buat 1 baris: [label] [-] [value] [+] */
+    private fun makeNudgeRow(
+        label: String, field: String, step: Int = nudgeStep,
+        min: Int? = null, max: Int? = null,
+        getter: () -> Int
+    ): TextView {
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(0, 4, 0, 4)
+        }
+        val labelView = TextView(this).apply {
+            text = label; setTextColor(Color.WHITE); textSize = 12f
+            setPadding(0, 0, 8, 0)
+        }
+        val valueView = TextView(this).apply {
+            text = "${getter()}"; setTextColor(Color.CYAN); textSize = 12f
+            minWidth = 80
+        }
+        fun updateVal() {
+            valueView.text = "${getter()}"
+            guideView?.invalidate()
+        }
+        fun setField(v: Int) = when (field) {
+            "scanLeft" -> MacroController.scanLeft = v
+            "scanRight" -> MacroController.scanRight = v
+            "scanTop" -> MacroController.scanTop = v
+            "scanBottom" -> MacroController.scanBottom = v
+            "brightThreshold" -> MacroController.brightThreshold = v
+            else -> {}
+        }
+        val btnMinus = Button(this).apply {
+            text = "−"; textSize = 12f
+            setOnClickListener {
+                val new = getter() - step
+                if (min == null || new >= min) { setField(new); updateVal() }
+            }
+        }
+        val btnPlus = Button(this).apply {
+            text = "+"; textSize = 12f
+            setOnClickListener {
+                val new = getter() + step
+                if (max == null || new <= max) { setField(new); updateVal() }
+            }
+        }
+        row.addView(labelView)
+        row.addView(btnMinus)
+        row.addView(valueView)
+        row.addView(btnPlus)
+        panelView.addView(row)
+        return valueView
+    }
 
+    private fun makeText(s: String) = TextView(this).apply {
+        text = s; setTextColor(Color.WHITE); textSize = 12f
+    }
+
+    private fun makeDivider(): View = View(this).apply {
+        layoutParams = LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, 2
+        ).apply { setMargins(0, 6, 0, 6) }
+        setBackgroundColor(Color.GRAY)
+    }
+
+    private fun makeDraggable() {
+        var ix = 0; var iy = 0; var tx = 0f; var ty = 0f
         rootView.setOnTouchListener { _, event ->
             when (event.action) {
-                MotionEvent.ACTION_DOWN -> {
-                    initialX = params.x
-                    initialY = params.y
-                    touchX = event.rawX
-                    touchY = event.rawY
-                    true
-                }
+                MotionEvent.ACTION_DOWN -> { ix = params.x; iy = params.y; tx = event.rawX; ty = event.rawY; true }
                 MotionEvent.ACTION_MOVE -> {
-                    params.x = initialX + (event.rawX - touchX).toInt()
-                    params.y = initialY + (event.rawY - touchY).toInt()
-                    windowManager.updateViewLayout(rootView, params)
-                    true
+                    params.x = ix + (event.rawX - tx).toInt()
+                    params.y = iy + (event.rawY - ty).toInt()
+                    windowManager.updateViewLayout(rootView, params); true
                 }
                 else -> false
             }
         }
     }
 
+    // ============ POLLING ============
+
     private fun startStatusPolling() {
         statusPoller = object : Runnable {
             override fun run() {
                 tvCapture.text = "Capture: ${if (ScreenCaptureService.isRunning) "ON" else "OFF"}"
-                tvAccessibility.text =
-                    "Accessibility: ${if (TapMacroAccessibilityService.instance != null) "ON" else "OFF"}"
-                toggleButton.text = if (MacroController.isHolding) "STOP" else "START"
-                guideView?.invalidate()   // redraw marker live
-                mainHandler.postDelayed(this, 500)
+                tvAccessibility.text = "Accessibility: ${if (TapMacroAccessibilityService.instance != null) "ON" else "OFF"}"
+                toggleButton.text = if (MacroController.isScanning) "STOP" else "START SCAN"
+                // refresh value text
+                tvL.text = "${MacroController.scanLeft}"
+                tvR.text = "${MacroController.scanRight}"
+                tvT.text = "${MacroController.scanTop}"
+                tvB.text = "${MacroController.scanBottom}"
+                tvThreshold.text = "${MacroController.brightThreshold}"
+                guideView?.invalidate()
+                mainHandler.postDelayed(this, 300)
             }
         }
         mainHandler.post(statusPoller!!)
@@ -206,17 +277,14 @@ class FloatingOverlayService : Service() {
     private fun startForegroundWithNotification() {
         val channelId = "macro_overlay_channel"
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(
-                channelId, "Macro Overlay", NotificationManager.IMPORTANCE_MIN
-            )
+            val channel = NotificationChannel(channelId, "Macro Overlay", NotificationManager.IMPORTANCE_MIN)
             (getSystemService(NotificationManager::class.java)).createNotificationChannel(channel)
         }
-        val notification = NotificationCompat.Builder(this, channelId)
-            .setContentTitle("Macro overlay aktif")
+        val notif = NotificationCompat.Builder(this, channelId)
+            .setContentTitle("Macro aktif")
             .setSmallIcon(android.R.drawable.ic_menu_view)
-            .setPriority(NotificationCompat.PRIORITY_MIN)
-            .build()
-        startForeground(2, notification)
+            .setPriority(NotificationCompat.PRIORITY_MIN).build()
+        startForeground(2, notif)
     }
 
     override fun onDestroy() {

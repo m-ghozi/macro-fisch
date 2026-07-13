@@ -1,53 +1,56 @@
 package com.example.macro
 
 /**
- * Singleton penghubung ScreenCaptureService (baca warna) <-> TapMacroAccessibilityService (kirim tap).
- * Sengaja pakai object biasa + callback (bukan LiveData/Flow) supaya overhead minimal.
+ * Singleton state — ScreenCaptureService (scan) <-> TapMacroAccessibilityService (tap).
  */
 object MacroController {
 
-    // ====== KALIBRASI - WAJIB DISESUAIKAN per device/resolusi ======
-    // Koordinat area bar di layar (dalam pixel resolusi asli device, BUKAN dp).
-    // Cara dapetin: buka Developer Options > Pointer Location, atau screenshot lalu ukur pakai editor gambar.
-    // Nilai landscape 2712x1220 (device Shiro), diukur dari screenshot Fase 3. Sesuaikan lagi kalau resolusi beda.
-    var barLeftX = 863
-    var barRightX = 1904
-    var barY = 1017               // Y garis horizontal bar (tempat marker abu-abu bergerak)
-    var targetX = 1632            // X posisi target/garis batas yang mau dituju (kalibrasi manual)
-    var tapX = 1360               // Titik X yang disentuh saat hold (tengah layar, "Tap & Hold Anywhere")
-    var tapY = 843
+    // ===== AREA SCAN (pixel absolut, resolusi landscape) =====
+    // Atur lewat overlay nudge buttons.
+    var scanLeft = 400
+    var scanTop = 200
+    var scanRight = 2000
+    var scanBottom = 1000
 
-    // Warna marker abu-abu (dari screenshot kira-kira RGB ~ (140,140,150)) -> kalibrasi pakai tool debug di bawah
-    var markerColorMin = intArrayOf(120, 120, 130)
-    var markerColorMax = intArrayOf(170, 170, 180)
+    // Piksel dengan R, G, B > nilai ini dianggap "putih" (outline lingkaran)
+    var brightThreshold = 200
+    // ========================================================
 
-    var toleranceStopPx = 4        // toleransi jarak (px) marker ke target sebelum release ditembak
-    // ================================================================
+    @Volatile var isScanning = false
+    @Volatile var pendingTapX = -1
+    @Volatile var pendingTapY = -1
 
-    @Volatile var isHolding = false
-    @Volatile var shouldRelease = false
-    @Volatile var lastMarkerX: Int = -1
+    // Cooldown setelah tap (ms) — biar gak ngetap lingkaran yang sama 2×
+    @Volatile var nextScanAtMs = 0L
 
-    // dipanggil dari ScreenCaptureService tiap frame baru
-    fun onMarkerDetected(markerX: Int) {
-        lastMarkerX = markerX
-        if (isHolding && kotlin.math.abs(markerX - targetX) <= toleranceStopPx) {
-            shouldRelease = true
-        }
+    fun startScanning() {
+        isScanning = true
+        pendingTapX = -1
+        pendingTapY = -1
+        nextScanAtMs = 0L
     }
 
-    fun startCycle() {
-        isHolding = true
-        shouldRelease = false
+    fun stopScanning() {
+        isScanning = false
+        pendingTapX = -1
+        pendingTapY = -1
     }
 
-    fun resetCycle() {
-        isHolding = false
-        shouldRelease = false
-        lastMarkerX = -1
+    fun setPendingTap(x: Int, y: Int) {
+        pendingTapX = x
+        pendingTapY = y
     }
 
-    fun forceRelease() {
-    shouldRelease = true
-}
+    fun clearPendingTap() {
+        pendingTapX = -1
+        pendingTapY = -1
+    }
+
+    /** Dipanggil tiap frame — cek apakah boleh scan sekarang. */
+    fun canScan(): Boolean {
+        if (!isScanning) return false
+        if (pendingTapX >= 0) return false   // udah nemu, tunggu ditao
+        if (System.currentTimeMillis() < nextScanAtMs) return false // cooldown
+        return true
+    }
 }
